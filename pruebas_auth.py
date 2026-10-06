@@ -236,7 +236,7 @@ for firebase, esperado in casos:
 ok("json roto no revienta", "codigo 500" in trad("no-json", 500))
 ok("sin mensaje util da codigo", "codigo 418" in trad("{}", 418))
 
-print("8. Sincronizador: cabecera Authorization")
+print("8. Sincronizador: el ID token va en ?auth=")
 peticiones = []
 
 
@@ -250,9 +250,12 @@ inv.urllib.request.urlopen = urlopen_ok
 sync = inv.Sincronizador("https://ejemplo.firebaseio.com", SesionStub())
 resultado = sync._pedir("GET", "")
 cab = peticiones[0].get_header("Authorization")
-ok("la peticion lleva Authorization", cab == "Bearer valido", str(cab))
+ok("el token va en ?auth=", "?auth=valido" in peticiones[0].full_url,
+   peticiones[0].full_url)
+ok("NO se usa la cabecera Authorization", "Bearer" not in (cab or ""),
+   str(cab))
 ok("va a inventario/productos",
-   "/inventario/productos/.json" in peticiones[0].full_url,
+   "/inventario/productos/.json?auth=" in peticiones[0].full_url,
    peticiones[0].full_url)
 ok("devuelve el json", resultado == {"SN1": {"S/N": "SN1"}})
 ok("no reintento si todo va bien", len(peticiones) == 1)
@@ -263,7 +266,7 @@ peticiones2 = []
 
 
 def urlopen_401(peticion, timeout=None):
-    peticiones2.append(peticion.get_header("Authorization"))
+    peticiones2.append(peticion.full_url)
     if len(peticiones2) == 1:
         raise error_http(401)
     return RespuestaFalsa('{"SN1": {"S/N": "SN1"}}')
@@ -278,7 +281,7 @@ ses2.respuesta = {"id_token": "nuevo", "expires_in": 3600}
 sync2 = inv.Sincronizador("https://ejemplo.firebaseio.com", ses2)
 resultado2 = sync2._pedir("GET", "")
 ok("reintenta una sola vez", len(peticiones2) == 2, str(peticiones2))
-ok("el reintento usa el token nuevo", peticiones2[1] == "Bearer nuevo",
+ok("el reintento usa el token nuevo", "?auth=nuevo" in peticiones2[1],
    str(peticiones2))
 ok("el resultado llega igual", resultado2 == {"SN1": {"S/N": "SN1"}})
 

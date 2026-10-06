@@ -69,9 +69,13 @@ Menu `Nube`:
 
 - Se usa **Firebase Authentication con correo y contrasena**. No hay token
   compartido ni contrasenas guardadas en el codigo.
-- Cada peticion a la base va con `Authorization: Bearer <idToken>`.
+- Cada peticion a la base lleva el ID token en `?auth=<idToken>`, que es la
+  forma que Realtime Database acepta. (En la cabecera `Authorization: Bearer`
+  la trata como un token OAuth de Google y la rechaza con
+  `Unauthorized request.`, sin llegar a mirar las reglas.)
 - Cuando el token caduca, la app lo renueva sola con el refresh token y
-  reintenta la peticion una vez. Si tambien falla, te avisa y cierra la sesion.
+  reintenta la peticion una vez. Si aun asi falla, dice cual de los dos es:
+  que las reglas bloquean el acceso, o que el token si caduco.
 - La contrasena **nunca** se guarda: solo se usa en el momento de entrar.
 - El refresh token se guarda en `sesion.dat` **cifrado con DPAPI** (solo tu
   cuenta de Windows puede leerlo). Si el equipo no permite cifrar, la app
@@ -126,7 +130,7 @@ python pruebas_auth.py
 ```
 
 Ahí se revisa el cifrado de la sesion, que el token nunca quede en claro, que
-las peticiones lleven `Authorization`, y que un `401` dispare la renovacion y
+las peticiones lleven el ID token en `?auth=`, y que un `401` dispare la renovacion y
 un unico reintento.
 
 ## Compilar

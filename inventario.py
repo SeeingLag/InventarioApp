@@ -682,8 +682,11 @@ class Sincronizador:
         url = "{0}/{1}/{2}.json".format(self.url, self.RUTA_BASE, camino)
         cabeceras = {"Content-Type": "application/json"}
         if self.sesion is not None:
-            cabeceras["Authorization"] = "Bearer " + self.sesion.token(
-                forzar=not reintentar)
+            # El ID token va en ?auth=, que es como Realtime Database lo
+            # acepta. En la cabecera Authorization: Bearer lo trata como si
+            # fuera un token OAuth de Google y lo rechaza con
+            # "Unauthorized request.", sin llegar a mirar las reglas.
+            url += "?auth=" + self.sesion.token(forzar=not reintentar)
         datos = json.dumps(cuerpo, ensure_ascii=False).encode("utf-8") if cuerpo is not None else None
         peticion = urllib.request.Request(url, data=datos, method=metodo,
                                           headers=cabeceras)
