@@ -642,6 +642,26 @@ class Sesion:
             return self.renovar()
         return self.id_token
 
+    def expires_info(self):
+        """Lee el token: devuelve (segundos que le quedan, correo) o None.
+
+        Sirve para distinguir un token caducado de unas reglas que rechazan:
+        si el token sigue vivo y Firebase lo rechaza, el problema son las
+        reglas de seguridad.
+        """
+        if not self.id_token:
+            return None
+        partes = self.id_token.split(".")
+        if len(partes) < 2:
+            return None
+        try:
+            relleno = partes[1] + "=" * (-len(partes[1]) % 4)
+            datos = json.loads(base64.urlsafe_b64decode(relleno).decode("utf-8"))
+            exp = int(datos.get("exp", 0))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return exp - int(time.time()), datos.get("email", self.correo)
+
 
 class Sincronizador:
     """Un registro por escrito: dos dispositivos nunca se pisan entero."""
@@ -672,19 +692,39 @@ class Sincronizador:
                 texto = respuesta.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                if self.sesion is not None:
-                    if reintentar:
-                        # El token caduco o fue revocado: se renueva y se repite.
-                        return self._pedir(metodo, camino, cuerpo, reintentar=False)
-                    self.sesion.cerrar()
+                if self.sesion is not None and reintentar:
+                    # Puede que el token caducara: se renueva y se reintenta.
+                    return self._pedir(metodo, camino, cuerpo, reintentar=False)
+                if self.sesion is None:
                     raise RuntimeError(
-                        "Tu sesion ya no es valida. Vuelve a iniciar sesion.") from None
+                        "Firebase rechazo la peticion porque no hay sesion "
+                        "iniciada. Ve a Nube > Iniciar sesion...") from None
+                # Ya se renovo y aun asi lo rechaza: no es una sesion caducada.
+                # Se invalida el token pero se conserva el refresh token, para
+                # no obligar a escribir la contrasena otra vez.
+                info = self.sesion.expires_info()
+                self.sesion.id_token = ""
+                self.sesion.caduca = 0.0
+                if info is None:
+                    raise RuntimeError(
+                        "Firebase no acepto tu sesion. Vuelve a iniciar sesion..."
+                    ) from None
+                if info[0] > 60:
+                    raise RuntimeError(
+                        "Tu sesion esta bien (caduca en {0} minutos), pero "
+                        "Firebase no deja leer ni escribir.\n\n"
+                        "El problema son las reglas de seguridad: la base esta "
+                        "cerrada para todos. Publica unas que permitan "
+                        "'auth != null' en inventario/productos.\n"
+                        "Las tienes en el README, seccion Nube (Firebase)."
+                        .format(int(info[0] // 60))) from None
                 raise RuntimeError(
-                    "Firebase rechazo la peticion sin iniciar sesion.") from None
+                    "Tu sesion caduco y no se pudo renovar. Vuelve a iniciar "
+                    "sesion...") from None
             if e.code == 403:
                 raise RuntimeError(
-                    "Las reglas de Firebase no permiten esto. Deben permitir "
-                    "'auth != null' en inventario/productos.") from None
+                    "Firebase no autorizo la operacion (403). Revisa los permisos "
+                    "de tu usuario y las reglas de seguridad.") from None
             if e.code == 404:
                 raise RuntimeError(
                     "La base no existe en esa URL. Revisa la configuracion.") from None

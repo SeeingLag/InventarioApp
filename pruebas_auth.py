@@ -53,9 +53,12 @@ class RespuestaFalsa:
 class SesionStub:
     """Sesion de mentira: siempre devuelve un token valido."""
 
-    def __init__(self, token="valido"):
+    def __init__(self, token="valido", segundos=1800):
         self.token_entregado = token
-        self.cercada = False
+        self.segundos = segundos
+        self.id_token = token
+        self.caduca = 0.0
+        self.cerrada = False
 
     @property
     def activa(self):
@@ -64,8 +67,21 @@ class SesionStub:
     def token(self, forzar=False):
         return self.token_entregado
 
+    def expires_info(self):
+        return (self.segundos, "alguien@example.com")
+
     def cerrar(self):
         self.cerrada = True
+
+
+def jwt_falso(segundos):
+    """Arma un JWT con exp para poder probar expires_info()."""
+    import base64 as b64
+    cab = b64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode("ascii")
+    cuerpo = b64.urlsafe_b64encode(
+        ('{"exp":%d,"email":"a@b.com"}' % int(time.time() + segundos)).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    return cab + "." + cuerpo + ".firma"
 
 
 TMP = tempfile.mkdtemp(prefix="inv_pruebas_")
@@ -189,6 +205,20 @@ ok("no vuelve a pedir si sigue vigente", s2.token() == "tok-nuevo")
 s2.respuesta = {"id_token": "forzado", "expires_in": 3600}
 ok("forzar=True renueva igual", s2.token(forzar=True) == "forzado")
 
+print("6b. Sesion: leer el token para diagnosticar")
+s3 = SesionPost()
+s3.refresh_token = "ref-456"
+s3.id_token = jwt_falso(1800)
+info = s3.expires_info()
+ok("lee cuando caduca el token", info is not None and info[0] > 1700, str(info))
+ok("lee el correo del token", info and info[1] == "a@b.com", str(info))
+s3.id_token = jwt_falso(-100)
+ok("detecta un token ya caducado", s3.expires_info()[0] < 0, str(s3.expires_info()))
+s3.id_token = "esto-no-es-un-jwt"
+ok("un token ilegible devuelve None", s3.expires_info() is None)
+s3.id_token = ""
+ok("sin token devuelve None", s3.expires_info() is None)
+
 print("7. Mensajes de error de Firebase")
 trad = inv.Sesion._traducir_error
 casos = [
@@ -252,7 +282,7 @@ ok("el reintento usa el token nuevo", peticiones2[1] == "Bearer nuevo",
    str(peticiones2))
 ok("el resultado llega igual", resultado2 == {"SN1": {"S/N": "SN1"}})
 
-print("10. Sincronizador: 401ersistent")
+print("10. Sincronizador: 401 con token vivo son las REGLAS")
 peticiones3 = []
 
 
@@ -262,17 +292,27 @@ def urlopen_401_siempre(peticion, timeout=None):
 
 
 inv.urllib.request.urlopen = urlopen_401_siempre
-ses3 = SesionStub()
-ses3.token_entregado = "malo"
-ses3.cerrada = False
+ses3 = SesionStub(segundos=1800)
 sync3 = inv.Sincronizador("https://ejemplo.firebaseio.com", ses3)
 try:
     sync3._pedir("GET", "")
-    ok("dos 401 avisan", False)
+    ok("401 con token vivo avisa", False)
 except RuntimeError as e:
-    ok("dos 401 avisan que la sesion ya no vale", "ya no es valida" in str(e), str(e))
+    ok("dice que son las reglas, no la sesion", "reglas" in str(e), str(e))
+    ok("dice que la sesion esta bien", "sesion esta bien" in str(e), str(e))
 ok("no insiste mas de dos veces", len(peticiones3) == 2, str(len(peticiones3)))
-ok("cierra la sesion caducada", ses3.cerrada is True)
+ok("no cierra la sesion", ses3.cerrada is False)
+ok("invalida solo el id token", ses3.id_token == "")
+
+print("10b. Sincronizador: 401 con token caducado si es la SESION")
+inv.urllib.request.urlopen = urlopen_401_siempre
+ses3b = SesionStub(segundos=-10)
+try:
+    inv.Sincronizador("https://ejemplo.firebaseio.com", ses3b)._pedir("GET", "")
+    ok("401 con token caducado avisa", False)
+except RuntimeError as e:
+    ok("pide volver a iniciar sesion", "sesion" in str(e), str(e))
+    ok("no culpa a las reglas", "reglas" not in str(e), str(e))
 
 print("11. Sincronizador: sin sesion")
 inv.urllib.request.urlopen = urlopen_401_siempre
@@ -281,14 +321,15 @@ try:
     sync4._pedir("GET", "")
     ok("sin sesion avisa", False)
 except RuntimeError as e:
-    ok("sin sesion avisa del 401", "sin iniciar sesion" in str(e), str(e))
+    ok("sin sesion avisa del 401", "no hay sesion" in str(e), str(e))
 
 print("12. Sincronizador: reglas que bloquean")
 inv.urllib.request.urlopen = lambda p, timeout=None: (_ for _ in ()).throw(
     error_http(403))
 sync5 = inv.Sincronizador("https://ejemplo.firebaseio.com", SesionStub())
 correcto, mensaje = sync5.probar()
-ok("el 403 explica las reglas", not correcto and "auth != null" in mensaje, mensaje)
+ok("el 403 remite a permisos y reglas",
+   not correcto and "reglas" in mensaje and "permisos" in mensaje, mensaje)
 
 print("13. Sincronizador: otros errores")
 inv.urllib.request.urlopen = lambda p, timeout=None: (_ for _ in ()).throw(
