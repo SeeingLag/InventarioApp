@@ -50,15 +50,64 @@ empieza con `S/N` y `Marca`. Acepta los 10 campos originales:
   la app la convierte a fecha real.
 - `FechaVenta` y `FechaEntrada` no hace falta que esten: son nuevas.
 
-## Nube (Firebase) — pendiente de configurar
+## Nube (Firebase)
 
-La app arranca **siempre en modo local**, sin nube. Para activarla:
-`Herramientas > Configurar Firebase` y pega la URL de tu Realtime Database.
+La app es **local primero**: abre y funciona siempre sin internet y sin
+cuenta. La nube solo suma la sincronizacion entre equipos.
 
-> Importante: hoy la app se conecta con la URL sola, sin usuario ni contrasena.
-> Eso solo es aceptable si las reglas de Firebase son publicas, lo cual
-> **no** es lo que queremos. Antes de subir datos reales hay que definir la
-> autenticacion (ver `Sincronizacion` en la lista de pendientes).
+Menu `Nube`:
+
+| Opcion | Que hace |
+| --- | --- |
+| **Iniciar sesion...** | Pide correo y contrasena de tu cuenta de Firebase. |
+| **Cerrar sesion** | Olvida la sesion guardada en este equipo (no borra tus datos locales). |
+| **Configurar Firebase...** | Cambia la URL de la base. Vacio = solo local. |
+| **Probar conexion** | Comprueba la URL y que la sesion tenga permiso. |
+| **Sincronizar ahora** | Baja lo remoto y sube lo local. |
+
+### Como queda protegido
+
+- Se usa **Firebase Authentication con correo y contrasena**. No hay token
+  compartido ni contrasenas guardadas en el codigo.
+- Cada peticion a la base va con `Authorization: Bearer <idToken>`.
+- Cuando el token caduca, la app lo renueva sola con el refresh token y
+  reintenta la peticion una vez. Si tambien falla, te avisa y cierra la sesion.
+- La contrasena **nunca** se guarda: solo se usa en el momento de entrar.
+- El refresh token se guarda en `sesion.dat` **cifrado con DPAPI** (solo tu
+  cuenta de Windows puede leerlo). Si el equipo no permite cifrar, la app
+  **no guarda nada** y te pide la contrasena de nuevo en cada arranque, en vez
+  de dejar el token en claro.
+- Las reglas de Firebase deben permitir solo a usuarios autenticados:
+  ver abajo.
+
+### Reglas de Firebase
+
+Las reglas de la Realtime Database tienen que ser estas:
+
+```json
+{
+  "rules": {
+    "inventario": {
+      "productos": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        ".indexOn": ["S/N", "Marca", "Estado"]
+      }
+    },
+    ".read": false,
+    ".write": false
+  }
+}
+```
+
+Sin sesion, Firebase responde `401` y la app no sube ni baja nada.
+
+### Que se guarda en la nube
+
+Un registro por serial en `inventario/productos`. Cada uno lleva un campo
+`_mod` con la fecha y hora del ultimo cambio: al sincronizar, cada equipo
+conserva la version mas reciente de cada producto, asi que dos equipos pueden
+trabajar a la vez sin pisarse.
 
 ## Pruebas
 
@@ -69,6 +118,16 @@ python pruebas.py
 No abre la ventana y no toca tus datos: trabaja en una carpeta temporal.
 Si encuentra tu `Inventario.xlsx` en la ruta que tiene en el archivo, ademas
 prueba la importacion real (364 productos) y que reimportar no borre ventas.
+
+El codigo de autenticacion se prueba aparte, sin red y sin necesitar cuenta:
+
+```
+python pruebas_auth.py
+```
+
+Ahí se revisa el cifrado de la sesion, que el token nunca quede en claro, que
+las peticiones lleven `Authorization`, y que un `401` dispare la renovacion y
+un unico reintento.
 
 ## Compilar
 

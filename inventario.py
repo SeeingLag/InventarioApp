@@ -1,10 +1,12 @@
 ﻿"""Gestion de inventario de SSD - version de escritorio (Windows).
 
 Solo usa la libreria estandar de Python: la aplicacion funciona sin internet
-guardando los datos en inventario.json, y sincroniza con Firebase si se
-configura una URL en config.json.
+guardando los datos en inventario.json. La nube es opcional y se activa
+iniciando sesion con Firebase Authentication (correo y contrasena); sin sesion
+todo sigue funcionando en local.
 """
 
+import base64
 import calendar
 import csv
 import hashlib
@@ -12,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -24,6 +27,12 @@ APP_NOMBRE = "Inventario SSD"
 RUTA_DATOS = "inventario.json"
 RUTA_CONFIG = "config.json"
 RUTA_RESPUALDO = "inventario_respaldo.json"
+RUTA_SESION = "sesion.dat"
+
+FIREBASE_URL = "https://inventarioapp-a80fe-default-rtdb.firebaseio.com"
+FIREBASE_API_KEY = "AIzaSyBE18DcN8k9DZoQ7BLuwwJKwPmoYGdJRvQ"
+IDENTITY_URL = "https://identitytoolkit.googleapis.com/v1"
+SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1"
 
 COLUMNAS = ["S/N", "Marca", "Modelo", "Tipo", "Capacidad", "Preciodecompra",
             "Estado", "Cliente", "PrecioVenta", "VenceGarantía",
@@ -78,6 +87,103 @@ def escribir_json_atomico(destino, datos):
     with open(temporal, "w", encoding="utf-8") as f:
         json.dump(datos, f, indent=2, ensure_ascii=False)
     os.replace(temporal, destino)
+
+
+def _dpapi(datos, cifrar=True):
+    """Cifra o descifra bytes con DPAPI de Windows (solo stdlib).
+
+    Devuelve None si DPAPI no esta disponible, para que la app siga
+    funcionando aunque el cifrado falle.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Blob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        advapi = ctypes.WinDLL("Advapi32.dll")
+        kernel = ctypes.WinDLL("Kernel32.dll")
+        buffer = (ctypes.c_char * (len(datos) + 1)).from_buffer_copy(datos + b"\x00")
+        origen = _Blob(len(datos), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+        destino = _Blob()
+        entrada = ctypes.byref(origen)
+        if cifrar:
+            exito = advapi.CryptProtectData(entrada, "InventarioApp", None, None,
+                                             None, 0x01, ctypes.byref(destino))
+        else:
+            exito = advapi.CryptUnprotectData(entrada, None, None, None, 0x01,
+                                               ctypes.byref(destino))
+        if not exito:
+            return None
+        try:
+            return ctypes.string_at(destino.pbData, destino.cbData)
+        finally:
+            kernel.LocalFree(destino.pbData)
+    except Exception:
+        return None
+
+
+def _borrar_sesion():
+    try:
+        os.remove(ruta(RUTA_SESION))
+    except OSError:
+        pass
+
+
+def _leer_sesion():
+    """Devuelve el refresh token guardado en disco, o "" si no hay.
+
+    Solo se aceptan archivos cifrados con DPAPI: cualquier otra cosa se
+    descarta, para no reutilizar un token que este en claro.
+    """
+    destino = ruta(RUTA_SESION)
+    if not os.path.exists(destino):
+        return ""
+    try:
+        with open(destino, "r", encoding="utf-8") as f:
+            contenido = f.read().strip()
+    except OSError:
+        return ""
+    if not contenido.startswith("dpapi:"):
+        _borrar_sesion()
+        return ""
+    try:
+        crudo = base64.b64decode(contenido[6:], validate=True)
+    except (ValueError, TypeError):
+        _borrar_sesion()
+        return ""
+    claro = _dpapi(crudo, cifrar=False)
+    if not claro:
+        _borrar_sesion()
+        return ""
+    try:
+        return claro.decode("utf-8")
+    except UnicodeDecodeError:
+        _borrar_sesion()
+        return ""
+
+
+def _guardar_sesion(refresh_token):
+    """Guarda el refresh token cifrado con DPAPI.
+
+    Devuelve False si no se pudo cifrar: en ese caso NO se guarda nada y la
+    sesion solo vive en memoria, para no dejar el token en claro en disco.
+    """
+    if not refresh_token:
+        _borrar_sesion()
+        return True
+    protegido = _dpapi(refresh_token.encode("utf-8"), cifrar=True)
+    if not protegido:
+        _borrar_sesion()
+        return False
+    contenido = "dpapi:" + base64.b64encode(protegido).decode("ascii")
+    with open(ruta(RUTA_SESION), "w", encoding="utf-8") as f:
+        f.write(contenido)
+    return True
 
 
 def normalizar_sn(valor):
@@ -424,27 +530,167 @@ def importar_filas(almacen, filas):
     return nuevos, actualizados
 
 
+class Sesion:
+    """Inicio de sesion con Firebase Authentication (correo y contrasena).
+
+    Guarda el refresh token cifrado con DPAPI para no pedir la contrasena
+    cada vez que se abre la app.
+    """
+
+    def __init__(self, api_key=FIREBASE_API_KEY):
+        self.api_key = api_key
+        self.correo = ""
+        self.id_token = ""
+        self.refresh_token = ""
+        self.caduca = 0.0
+        # False si el equipo no deja cifrar la sesion: habra que entrar cada vez.
+        self.persistida = True
+
+    @property
+    def activa(self):
+        return bool(self.id_token or self.refresh_token)
+
+    def iniciar(self):
+        """Carga el refresh token guardado. No toca la red."""
+        self.refresh_token = _leer_sesion()
+        return self.activa
+
+    def cerrar(self):
+        self.correo = ""
+        self.id_token = ""
+        self.refresh_token = ""
+        self.caduca = 0.0
+        _guardar_sesion("")
+
+    def _post(self, url, cuerpo):
+        peticion = urllib.request.Request(
+            url, data=json.dumps(cuerpo).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(peticion, timeout=25) as respuesta:
+                return json.loads(respuesta.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(self._traducir_error(
+                e.read().decode("utf-8", "replace"), e.code)) from None
+        except urllib.error.URLError:
+            raise RuntimeError("No hay conexion a internet.") from None
+        except ValueError:
+            raise RuntimeError("Firebase devolvio algo que no se entiende.") from None
+
+    @staticmethod
+    def _traducir_error(cuerpo, codigo):
+        mensaje = ""
+        try:
+            mensaje = json.loads(cuerpo).get("error", {}).get("message", "")
+        except (ValueError, AttributeError):
+            pass
+        if any(x in mensaje for x in ("INVALID_LOGIN_CREDENTIALS", "INVALID_PASSWORD",
+                                      "EMAIL_NOT_FOUND", "INVALID_EMAIL")):
+            return "Correo o contrasena incorrectos."
+        if "USER_DISABLED" in mensaje:
+            return "Esa cuenta esta deshabilitada."
+        if "OPERATION_NOT_ALLOWED" in mensaje:
+            return ("El metodo correo/contrasena no esta habilitado. "
+                    "Activalo en Firebase > Authentication.")
+        if "API_KEY_INVALID" in mensaje or "CONFIGURATION_NOT_FOUND" in mensaje:
+            return "La API key de Firebase no es valida."
+        if any(x in mensaje for x in ("TOO_MANY_ATTEMPTS", "QUOTA_EXCEEDED",
+                                      "BLOCKING_FUNCTION")):
+            return "Demasiados intentos. Espera unos minutos e intentalo de nuevo."
+        if "NETWORK" in mensaje or "UNAVAILABLE" in mensaje:
+            return "No hay conexion a internet."
+        return "No se pudo iniciar sesion (codigo {0}).".format(codigo)
+
+    def entrar(self, correo, contrasena):
+        correo = (correo or "").strip()
+        if not correo or "@" not in correo:
+            raise RuntimeError("Escribe un correo valido.")
+        if not contrasena:
+            raise RuntimeError("Escribe la contrasena.")
+        datos = self._post(
+            "{0}/accounts:signInWithPassword?key={1}".format(IDENTITY_URL, self.api_key),
+            {"email": correo, "password": contrasena, "returnSecureToken": True})
+        self._adoptar(datos)
+        self.persistida = _guardar_sesion(self.refresh_token)
+        return self.correo
+
+    def _adoptar(self, datos):
+        self.id_token = datos.get("idToken", "")
+        self.refresh_token = datos.get("refreshToken", self.refresh_token)
+        self.correo = datos.get("email", self.correo)
+        self.caduca = time.time() + max(60, int(datos.get("expiresIn", 3600)) - 120)
+
+    def renovar(self):
+        if not self.refresh_token:
+            raise RuntimeError("No has iniciado sesion.")
+        datos = self._post(
+            "{0}/token?key={1}".format(SECURE_TOKEN_URL, self.api_key),
+            {"grant_type": "refresh_token", "refresh_token": self.refresh_token})
+        token = datos.get("id_token", "")
+        if not token:
+            raise RuntimeError("Firebase no devolvio un token nuevo.")
+        self.id_token = token
+        if datos.get("refresh_token"):
+            self.refresh_token = datos["refresh_token"]
+            self.persistida = _guardar_sesion(self.refresh_token)
+        self.caduca = time.time() + max(60, int(datos.get("expires_in", 3600)) - 120)
+        return self.id_token
+
+    def token(self, forzar=False):
+        """Devuelve un id token vigente, renovandolo si ya caduco."""
+        if not self.id_token or forzar or time.time() >= self.caduca:
+            return self.renovar()
+        return self.id_token
+
+
 class Sincronizador:
     """Un registro por escrito: dos dispositivos nunca se pisan entero."""
 
     RUTA_BASE = "inventario/productos"
 
-    def __init__(self, url=""):
+    def __init__(self, url="", sesion=None):
         self.url = (url or "").rstrip("/")
+        self.sesion = sesion
 
     @property
     def activo(self):
         return bool(self.url)
 
-    def _pedir(self, metodo, camino, cuerpo=None):
+    def _pedir(self, metodo, camino, cuerpo=None, reintentar=True):
         if not self.activo:
             raise RuntimeError("No hay URL de sincronizacion configurada.")
         url = "{0}/{1}/{2}.json".format(self.url, self.RUTA_BASE, camino)
+        cabeceras = {"Content-Type": "application/json"}
+        if self.sesion is not None:
+            cabeceras["Authorization"] = "Bearer " + self.sesion.token(
+                forzar=not reintentar)
         datos = json.dumps(cuerpo, ensure_ascii=False).encode("utf-8") if cuerpo is not None else None
         peticion = urllib.request.Request(url, data=datos, method=metodo,
-                                          headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(peticion, timeout=20) as respuesta:
-            texto = respuesta.read().decode("utf-8")
+                                          headers=cabeceras)
+        try:
+            with urllib.request.urlopen(peticion, timeout=25) as respuesta:
+                texto = respuesta.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                if self.sesion is not None:
+                    if reintentar:
+                        # El token caduco o fue revocado: se renueva y se repite.
+                        return self._pedir(metodo, camino, cuerpo, reintentar=False)
+                    self.sesion.cerrar()
+                    raise RuntimeError(
+                        "Tu sesion ya no es valida. Vuelve a iniciar sesion.") from None
+                raise RuntimeError(
+                    "Firebase rechazo la peticion sin iniciar sesion.") from None
+            if e.code == 403:
+                raise RuntimeError(
+                    "Las reglas de Firebase no permiten esto. Deben permitir "
+                    "'auth != null' en inventario/productos.") from None
+            if e.code == 404:
+                raise RuntimeError(
+                    "La base no existe en esa URL. Revisa la configuracion.") from None
+            raise RuntimeError("Firebase respondio con error {0}.".format(e.code)) from None
+        except urllib.error.URLError:
+            raise RuntimeError("No se pudo alcanzar Firebase. Revisa tu conexion.") from None
         return json.loads(texto) if texto else None
 
     def descargar(self):
@@ -480,33 +726,43 @@ class Sincronizador:
         self._pedir("DELETE", clave_firebase(serial))
 
     def probar(self):
-        """Comprueba que la URL responde y es una base de Firebase."""
+        """Comprueba que la URL responde y que la sesion tiene acceso."""
         try:
             self._pedir("GET", "")
             return True, "Conexion correcta."
-        except urllib.error.HTTPError as e:
-            if e.code == 401 or e.code == 403:
-                return False, ("Las reglas de Firebase rechazan el acceso "
-                               "(codigo {0}). Revisa las reglas de seguridad.").format(e.code)
-            return False, "Firebase respondio con error {0}.".format(e.code)
-        except urllib.error.URLError:
-            return False, "No se pudo alcanzar la URL. Revisa la conexion a internet."
+        except RuntimeError as e:
+            return False, str(e)
         except Exception as e:
             return False, "Error inesperado: {0}".format(e)
 
 
 def leer_config():
+    """Configuracion local. Nunca contiene contrasenas ni tokens."""
+    datos = {"sync_url": FIREBASE_URL, "api_key": FIREBASE_API_KEY, "correo": ""}
     if os.path.exists(ruta(RUTA_CONFIG)):
         try:
             with open(ruta(RUTA_CONFIG), "r", encoding="utf-8") as f:
-                return json.load(f)
+                guardado = json.load(f)
+            if isinstance(guardado, dict):
+                for campo in ("sync_url", "api_key", "correo"):
+                    if isinstance(guardado.get(campo), str):
+                        datos[campo] = guardado[campo]
         except (ValueError, OSError):
             pass
-    return {"sync_url": ""}
+    return datos
 
 
-def guardar_config(url):
-    escribir_json_atomico(ruta(RUTA_CONFIG), {"sync_url": url.strip()})
+def guardar_config(url=None, api_key=None, correo=None):
+    """Actualiza la configuracion. Solo recibe lo que se cambia."""
+    datos = leer_config()
+    if url is not None:
+        datos["sync_url"] = url.strip()
+    if api_key is not None:
+        datos["api_key"] = api_key.strip()
+    if correo is not None:
+        datos["correo"] = correo.strip()
+    escribir_json_atomico(ruta(RUTA_CONFIG), datos)
+    return datos
 
 
 # --------------------------------------------------------------------------
@@ -580,6 +836,59 @@ def limpiar_seriales(texto):
 # --------------------------------------------------------------------------
 # INTERFAZ GRAFICA
 # --------------------------------------------------------------------------
+class DialogoLogin(tk.Toplevel):
+    """Pide correo y contrasena para entrar a Firebase."""
+
+    def __init__(self, padre, correo_sugerido=""):
+        super().__init__(padre)
+        self.title("Iniciar sesion")
+        self.resizable(False, False)
+        self.transient(padre)
+        self.correo = tk.StringVar(value=correo_sugerido)
+        self.clave = tk.StringVar()
+        self.ver = tk.BooleanVar(value=False)
+        self.error = tk.StringVar()
+        self.resultado = None
+        self.padre = padre
+
+        marco = ttk.Frame(self, padding=16)
+        marco.pack(fill="both", expand=True)
+        ttk.Label(marco, text="Correo").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(marco, textvariable=self.correo, width=34).grid(
+            row=0, column=1, pady=(0, 6))
+        ttk.Label(marco, text="Contrasena").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        self.entrada_clave = ttk.Entry(marco, textvariable=self.clave, width=34, show="*")
+        self.entrada_clave.grid(row=1, column=1, pady=(0, 6))
+        ttk.Checkbutton(marco, text="Mostrar contrasena", variable=self.ver,
+                        command=self._al_mostrar).grid(row=2, column=1, sticky="w")
+        ttk.Label(marco, textvariable=self.error, foreground="#b00",
+                  wraplength=300, justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        botones = ttk.Frame(marco)
+        botones.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(botones, text="Entrar", command=self._aceptar).pack(side="right")
+        ttk.Button(botones, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
+
+        self.bind("<Return>", lambda e: self._aceptar())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.entrada_clave.focus_set()
+        self.grab_set()
+
+    def _al_mostrar(self):
+        self.entrada_clave.configure(show="" if self.ver.get() else "*")
+
+    def _aceptar(self):
+        self.error.set("Entrando...")
+        self.update_idletasks()
+        try:
+            self.resultado = self.padre.sesion.entrar(
+                self.correo.get(), self.clave.get())
+        except RuntimeError as e:
+            self.error.set(str(e))
+            return
+        self.destroy()
+
+
 class Ventana(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -589,7 +898,10 @@ class Ventana(tk.Tk):
 
         self.almacen = Almacen()
         self.almacen.cargar()
-        self.sync = Sincronizador(leer_config().get("sync_url", ""))
+        config = leer_config()
+        self.sesion = Sesion(config.get("api_key") or FIREBASE_API_KEY)
+        self.sesion.iniciar()
+        self.sync = Sincronizador(config.get("sync_url") or FIREBASE_URL, self.sesion)
 
         self.vars = {}
         self._construir_menu()
@@ -609,6 +921,9 @@ class Ventana(tk.Tk):
         barra.add_cascade(label="Archivo", menu=menu_datos)
 
         menu_nube = tk.Menu(barra, tearoff=0)
+        menu_nube.add_command(label="Iniciar sesion...", command=self.iniciar_sesion)
+        menu_nube.add_command(label="Cerrar sesion", command=self.cerrar_sesion)
+        menu_nube.add_separator()
         menu_nube.add_command(label="Configurar Firebase...", command=self.configurar_sync)
         menu_nube.add_command(label="Probar conexion", command=self.probar_sync)
         menu_nube.add_command(label="Sincronizar ahora", command=self.sincronizar_ahora)
@@ -897,14 +1212,16 @@ class Ventana(tk.Tk):
 
     def refrescar_estado(self):
         total = len(self.almacen.registros)
-        if self.sync.activo:
-            self.etiqueta_estado.configure(
-                text="Nube activa  |  {0} productos en esta maquina".format(total),
-                foreground="#1a7f37")
+        datos = "{0} productos".format(total)
+        if not self.sync.activo:
+            texto, color = "Solo local (sin nube)  |  " + datos, "#a33"
+        elif self.sesion.activa:
+            texto = "En la nube como {0}  |  {1}".format(
+                self.sesion.correo or "tu cuenta", datos)
+            color = "#1a7f37"
         else:
-            self.etiqueta_estado.configure(
-                text="Solo local (sin nube)  |  {0} productos".format(total),
-                foreground="#a33")
+            texto, color = "Nube lista, sesion no iniciada  |  " + datos, "#b8860b"
+        self.etiqueta_estado.configure(text=texto, foreground=color)
 
     # -- acciones ----------------------------------------------------------
     def registrar_entrada(self):
@@ -1156,6 +1473,47 @@ class Ventana(tk.Tk):
         self._tras_escribir("Eliminado {0}".format(serial), 0)
 
     # -- nube --------------------------------------------------------------
+    def iniciar_sesion(self):
+        if self.sesion.activa and self.sesion.id_token:
+            messagebox.showinfo("Sesion activa", "Ya estas dentro como {0}.".format(
+                self.sesion.correo or "tu cuenta"))
+            return
+        dialogo = DialogoLogin(self, leer_config().get("correo", ""))
+        self.wait_window(dialogo)
+        if dialogo.resultado:
+            guardar_config(correo=dialogo.resultado)
+            self.refrescar_estado()
+            texto = ("Listo como {0}.\n\nYa puedes sincronizar desde el boton de arriba."
+                     .format(dialogo.resultado))
+            if not self.sesion.persistida:
+                texto += ("\n\nOjo: este equipo no deja cifrar la sesion, asi que"
+                          "\ntendras que volver a escribir la contrasena cada vez.")
+            messagebox.showinfo("Sesion iniciada", texto)
+        else:
+            self.refrescar_estado()
+
+    def cerrar_sesion(self):
+        if not self.sesion.activa:
+            messagebox.showinfo("Sesion", "No habia ninguna sesion iniciada.")
+            return
+        self.sesion.cerrar()
+        guardar_config(correo="")
+        self.refrescar_estado()
+        messagebox.showinfo("Sesion cerrada",
+                            "Se borro la sesion guardada en este equipo.\n"
+                            "Tus datos locales no se tocaron.")
+
+    def _pedir_login(self):
+        """Si no hay sesion, la pide. Devuelve True si se puede seguir."""
+        if self.sesion.activa:
+            return True
+        messagebox.showinfo(
+            "Sesion necesaria",
+            "Para sincronizar hay que iniciar sesion con tu cuenta de Firebase.\n\n"
+            "Puedes seguir trabajando en local sin iniciar sesion.")
+        self.iniciar_sesion()
+        return self.sesion.activa
+
     def configurar_sync(self):
         actual = leer_config().get("sync_url", "")
         entrada = simpledialog.Dialog(
@@ -1165,22 +1523,28 @@ class Ventana(tk.Tk):
             strings={"text": actual}).result
         if entrada is None:
             return
-        self.sync = Sincronizador(entrada)
-        guardar_config(entrada)
+        self.sync = Sincronizador(entrada, self.sesion)
+        guardar_config(url=entrada)
         if not self.sync.activo:
             messagebox.showinfo("Sin nube", "Se guardo vacio: la app quedo solo local.")
             self.refrescar_estado()
             return
+        if not self._pedir_login():
+            messagebox.showwarning(
+                "Sin sesion",
+                "La URL quedo guardada, pero hace falta iniciar sesion para usarla.")
+            self.refrescar_estado()
+            return
         correcto, mensaje = self.sync.probar()
-        if not correcto:
-            messagebox.showerror("No se pudo conectar", mensaje)
-        else:
-            messagebox.showinfo("Listo", "Sincronizacion activa.\n" + mensaje)
+        (messagebox.showinfo if correcto else messagebox.showerror)(
+            "Configurar Firebase", mensaje)
         self.refrescar_estado()
 
     def probar_sync(self):
         if not self.sync.activo:
             messagebox.showinfo("Sin nube", "Configura una URL en Nube > Configurar Firebase.")
+            return
+        if not self._pedir_login():
             return
         correcto, mensaje = self.sync.probar()
         (messagebox.showinfo if correcto else messagebox.showerror)(
@@ -1189,6 +1553,8 @@ class Ventana(tk.Tk):
     def sincronizar_ahora(self):
         if not self.sync.activo:
             messagebox.showinfo("Sin nube", "Configura una URL en Nube > Configurar Firebase.")
+            return
+        if not self._pedir_login():
             return
         try:
             self.sync.almacen = self.almacen
@@ -1257,7 +1623,11 @@ class Ventana(tk.Tk):
 
     # -- comun -------------------------------------------------------------
     def _tras_escribir(self, mensaje, repetidos):
-        if self.sync.activo:
+        texto = mensaje
+        if repetidos:
+            texto += "\n({0} serial(es) ya existian y se omitieron)".format(repetidos)
+        # Sin sesion el dato se queda en local y sube la proxima sincronizacion.
+        if self.sync.activo and self.sesion.activa:
             try:
                 self.sync.almacen = self.almacen
                 self.sync.subir(self.almacen.registros)
@@ -1269,10 +1639,9 @@ class Ventana(tk.Tk):
                         mensaje, e))
                 self._refrescar_todo()
                 return
+        elif self.sync.activo:
+            texto += "\n\nQuedo solo en este equipo. Sincroniza cuando inicies sesion."
         self._refrescar_todo()
-        texto = mensaje
-        if repetidos:
-            texto += "\n({0} serial(es) ya existian y se omitieron)".format(repetidos)
         messagebox.showinfo("Listo", texto)
 
 

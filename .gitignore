@@ -3,6 +3,10 @@ inventario.json
 inventario_respaldo_*.json
 config.json
 
+# Sesion de Firebase: contiene el token cifrado. Jamas al repositorio
+sesion.dat
+sesion.dat.*
+
 # Excel y CSV exportados por el usuario
 *.csv
 Inventario*.xlsx

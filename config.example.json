@@ -1,3 +1,5 @@
 {
-  "sync_url": ""
+  "sync_url": "https://inventarioapp-a80fe-default-rtdb.firebaseio.com",
+  "api_key": "",
+  "correo": ""
 }
