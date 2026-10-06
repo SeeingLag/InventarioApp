@@ -1,0 +1,44 @@
+# Datos del usuario: nunca se suben al repositorio
+inventario.json
+inventario_respaldo_*.json
+config.json
+
+# Excel y CSV exportados por el usuario
+*.csv
+Inventario*.xlsx
+
+# Compilacion
+build/
+dist/
+*.manifest
+*.spec
+
+# Instalador
+installer/*.exe
+releases/pc/*
+!releases/pc/.gitkeep
+releases/android/*
+!releases/android/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Android
+android-app/www/vendor/
+android-app/platforms/
+android-app/plugins/
+android-app/node_modules/
+android-app/package-lock.json
+
+# Sistema y editores
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.log
