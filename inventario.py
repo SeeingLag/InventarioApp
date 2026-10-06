@@ -1,4 +1,4 @@
-﻿"""Gestion de inventario de SSD - version de escritorio (Windows).
+"""Gestion de inventario de SSD - version de escritorio (Windows).
 
 Solo usa la libreria estandar de Python: la aplicacion funciona sin internet
 guardando los datos en inventario.json. La nube es opcional y se activa
@@ -691,6 +691,16 @@ class Sincronizador:
             with urllib.request.urlopen(peticion, timeout=25) as respuesta:
                 texto = respuesta.read().decode("utf-8")
         except urllib.error.HTTPError as e:
+            # La respuesta de Firebase dice la causa exacta (por ejemplo
+            # "Permission denied"), asi que se enseña en vez de adivinarse.
+            try:
+                nota = (e.read() or b"").decode("utf-8", "replace").strip()
+            except Exception:
+                nota = ""
+            if len(nota) > 200:
+                nota = nota[:200] + "..."
+            if nota:
+                nota = "\n\nRespondio Firebase: " + nota
             if e.code == 401:
                 if self.sesion is not None and reintentar:
                     # Puede que el token caducara: se renueva y se reintenta.
@@ -698,7 +708,7 @@ class Sincronizador:
                 if self.sesion is None:
                     raise RuntimeError(
                         "Firebase rechazo la peticion porque no hay sesion "
-                        "iniciada. Ve a Nube > Iniciar sesion...") from None
+                        "iniciada. Ve a Nube > Iniciar sesion..." + nota) from None
                 # Ya se renovo y aun asi lo rechaza: no es una sesion caducada.
                 # Se invalida el token pero se conserva el refresh token, para
                 # no obligar a escribir la contrasena otra vez.
@@ -708,27 +718,32 @@ class Sincronizador:
                 if info is None:
                     raise RuntimeError(
                         "Firebase no acepto tu sesion. Vuelve a iniciar sesion..."
-                    ) from None
+                        + nota) from None
                 if info[0] > 60:
-                    raise RuntimeError(
+                    # El texto de Firebase se agrega DESPUES del format: si se
+                    # concatena antes, sus llaves se tomarian como campos.
+                    mensaje = (
                         "Tu sesion esta bien (caduca en {0} minutos), pero "
                         "Firebase no deja leer ni escribir.\n\n"
-                        "El problema son las reglas de seguridad: la base esta "
+                        "Casi siempre son las reglas de seguridad: la base esta "
                         "cerrada para todos. Publica unas que permitan "
                         "'auth != null' en inventario/productos.\n"
-                        "Las tienes en el README, seccion Nube (Firebase)."
-                        .format(int(info[0] // 60))) from None
+                        "Estan en el README, seccion Nube (Firebase)."
+                    ).format(int(info[0] // 60))
+                    raise RuntimeError(mensaje + nota) from None
                 raise RuntimeError(
                     "Tu sesion caduco y no se pudo renovar. Vuelve a iniciar "
-                    "sesion...") from None
+                    "sesion..." + nota) from None
             if e.code == 403:
                 raise RuntimeError(
                     "Firebase no autorizo la operacion (403). Revisa los permisos "
-                    "de tu usuario y las reglas de seguridad.") from None
+                    "de tu usuario y las reglas de seguridad." + nota) from None
             if e.code == 404:
                 raise RuntimeError(
-                    "La base no existe en esa URL. Revisa la configuracion.") from None
-            raise RuntimeError("Firebase respondio con error {0}.".format(e.code)) from None
+                    "La base no existe en esa URL. Revisa la configuracion."
+                    + nota) from None
+            raise RuntimeError("Firebase respondio con error {0}.".format(e.code)
+                               + nota) from None
         except urllib.error.URLError:
             raise RuntimeError("No se pudo alcanzar Firebase. Revisa tu conexion.") from None
         return json.loads(texto) if texto else None

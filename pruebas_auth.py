@@ -304,6 +304,21 @@ ok("no insiste mas de dos veces", len(peticiones3) == 2, str(len(peticiones3)))
 ok("no cierra la sesion", ses3.cerrada is False)
 ok("invalida solo el id token", ses3.id_token == "")
 
+print("10a. El cuerpo de Firebase con llaves no rompe el mensaje")
+inv.urllib.request.urlopen = lambda p, timeout=None: (_ for _ in ()).throw(
+    error_http(401, 'Permission denied {"error":{"message":"x"}}'))
+ses3a = SesionStub(segundos=1800)
+try:
+    inv.Sincronizador("https://ejemplo.firebaseio.com", ses3a)._pedir("GET", "")
+    ok("cuerpo con llaves no revienta", False, "no hubo error")
+except KeyError as e:
+    ok("cuerpo con llaves no revienta (KeyError)", False, str(e))
+except RuntimeError as e:
+    ok("cuerpo con llaves no revienta", True)
+    ok("el mensaje incluye la respuesta de Firebase",
+       "Respondio Firebase" in str(e), str(e))
+    ok("el mensaje sigue hablando de las reglas", "reglas" in str(e), str(e))
+
 print("10b. Sincronizador: 401 con token caducado si es la SESION")
 inv.urllib.request.urlopen = urlopen_401_siempre
 ses3b = SesionStub(segundos=-10)
